@@ -1,0 +1,14 @@
+services:
+  bulletin:
+    build: .
+    image: bulletin-api:latest
+    ports:
+      - "${BULLETIN_PORT:-8000}:8000"
+    environment:
+      BULLETIN_DB: /data/bulletins.sqlite3
+    volumes:
+      - bulletin-data:/data
+    restart: unless-stopped
+
+volumes:
+  bulletin-data:
