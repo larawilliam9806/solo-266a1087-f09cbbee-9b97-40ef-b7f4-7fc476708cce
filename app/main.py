@@ -11,6 +11,7 @@ from .db import db_path_from_env
 from .errors import ApiError
 from .models import (
     QUARTER_PATTERN,
+    BackfillBatch,
     DetailSubmission,
     MaskSubmission,
     PublishRequest,
@@ -105,6 +106,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def create_token(body: TokenRequest, editor: Editor) -> dict[str, Any]:
         token_id, token = service.create_token(body.label)
         return {"id": token_id, "label": body.label, "token": token}
+
+    @app.post("/api/v1/editor/backfill")
+    def backfill(editor: Editor,
+                 body: BackfillBatch = Body(...)) -> dict[str, Any]:
+        return service.backfill(body, editor)
 
     @app.get("/api/v1/editor/quarters/{quarter}")
     def editor_quarter(quarter: Quarter, editor: Editor) -> dict[str, Any]:

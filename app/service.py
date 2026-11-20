@@ -31,8 +31,10 @@ from . import suppression
 from .db import transaction
 from .errors import ApiError, conflict, not_found
 from .models import (
+    BackfillBatch,
     DetailSubmission,
     MaskSubmission,
+    PublishedCopy,
     PublishRequest,
     TotalsRegistration,
 )
@@ -105,6 +107,108 @@ def totals_mismatch(issues: list[dict]) -> ApiError:
         {"rows": bad_rows, "columns": bad_cols, "mismatches": issues,
          "note": "the previous valid detail version is kept unchanged"},
     )
+
+
+# ---------------------------------------------------------------------- copies
+
+def _content_fingerprint(payload: dict[str, Any]) -> str:
+    """Hash of the public content, ignoring the archival timestamp."""
+    content = {key: value for key, value in payload.items()
+               if key != "published_at"}
+    return hashlib.sha256(
+        json.dumps(content, sort_keys=True, ensure_ascii=False)
+        .encode("utf-8")
+    ).hexdigest()
+
+
+def _same_content(stored_json: str, payload: dict[str, Any]) -> bool:
+    return _content_fingerprint(json.loads(stored_json)) == \
+        _content_fingerprint(payload)
+
+
+def copy_axes(copy: PublishedCopy) -> tuple[list[str], list[str],
+                                            list[int], list[int]]:
+    districts = [row.name.strip() for row in copy.districts]
+    industries = [col.name.strip() for col in copy.industries]
+    row_totals = [row.total for row in copy.districts]
+    col_totals = [col.total for col in copy.industries]
+    return districts, industries, row_totals, col_totals
+
+
+def copy_visible(copy: PublishedCopy) -> dict[tuple[int, int], int]:
+    """The disclosed cells of a copy.  ``None`` marks a masked cell."""
+    visible: dict[tuple[int, int], int] = {}
+    for i, row in enumerate(copy.cells):
+        for j, value in enumerate(row):
+            if value is not None:
+                visible[(i, j)] = value
+    return visible
+
+
+def copy_problems(copy: PublishedCopy) -> list[dict]:
+    """Every rule violation of one copy, evaluated on the copy alone.
+
+    A copy is acceptable only when it is self-consistent: the two margin
+    axes agree on the grand total, every visible cell is consistent with its
+    margins and the masking rules, the disclosed pattern admits a completed
+    non-negative integer table, and every masked cell has at least two
+    possible values in that table.
+    """
+    districts, industries, row_totals, col_totals = copy_axes(copy)
+    n_rows, n_cols = len(districts), len(industries)
+    visible = copy_visible(copy)
+    masked = {(i, j) for i in range(n_rows) for j in range(n_cols)
+              if (i, j) not in visible}
+    problems: list[dict] = []
+
+    def add(kind: str, message: str, **detail) -> None:
+        problems.append({"kind": kind, "message": message, **detail})
+
+    if sum(row_totals) != sum(col_totals):
+        add("totals_inconsistent",
+            "the district total and the industry total differ",
+            district_sum=sum(row_totals), industry_sum=sum(col_totals))
+        # Margins cannot both hold; nothing below can be decided.
+        return problems
+
+    for i, expected in enumerate(row_totals):
+        disclosed = sum(visible[(i, j)] for j in range(n_cols)
+                        if (i, j) in visible)
+        if disclosed > expected:
+            add("visible_cells_exceed_margin",
+                "the disclosed cells already exceed the published total",
+                axis="district", index=i, total=expected, visible_sum=disclosed)
+    for j, expected in enumerate(col_totals):
+        disclosed = sum(visible[(i, j)] for i in range(n_rows)
+                        if (i, j) in visible)
+        if disclosed > expected:
+            add("visible_cells_exceed_margin",
+                "the disclosed cells already exceed the published total",
+                axis="industry", index=j, total=expected, visible_sum=disclosed)
+
+    for (i, j), value in sorted(visible.items()):
+        if 1 <= value <= 4:
+            add("sensitive_cell_visible",
+                "cells with 1-4 households must be masked",
+                row=i, col=j, value=value)
+
+    completed = suppression.complete_table(row_totals, col_totals, visible)
+    if completed is None:
+        add("no_feasible_table",
+            "no non-negative integer table with these totals has exactly "
+            "these visible cells")
+        return problems
+
+    cells = sorted(masked)
+    bounds = {cell: suppression.cell_bounds(completed, cells, cell)
+              for cell in cells}
+    for cell in cells:
+        low, high = bounds[cell]
+        if low == high:
+            add("cell_uniquely_determined",
+                "a masked cell has only one possible value",
+                row=cell[0], col=cell[1], possible_value=low)
+    return problems
 
 
 class BulletinService:
@@ -196,6 +300,19 @@ class BulletinService:
         return conn.execute("SELECT * FROM bulletins WHERE quarter=?",
                             (quarter,)).fetchone()
 
+    def _ensure_writable(self, conn, quarter: str) -> None:
+        """A back-filled quarter is authoritative: local drafts are read-only."""
+        bulletin = self._bulletin_row(conn, quarter)
+        if bulletin is not None and bulletin["source"] == "backfill":
+            raise conflict(
+                "quarter_read_only",
+                f"{quarter} was back-filled from a public copy; its published "
+                f"totals and disclosed cells are authoritative",
+                {"quarter": quarter,
+                 "published_at": bulletin["published_at"],
+                 "hint": "the back-filled copy cannot be edited or republished"},
+            )
+
     @staticmethod
     def _mask_row(conn, quarter: str, detail_version: int):
         return conn.execute(
@@ -286,6 +403,7 @@ class BulletinService:
         try:
             with transaction(conn):
                 q = self._quarter_row(conn, quarter)
+                self._ensure_writable(conn, quarter)
                 row_totals = json.loads(q["row_totals"])
                 col_totals = json.loads(q["col_totals"])
                 validate_dimensions(body.values, len(row_totals), len(col_totals))
@@ -362,6 +480,7 @@ class BulletinService:
         try:
             with transaction(conn):
                 self._quarter_row(conn, quarter)
+                self._ensure_writable(conn, quarter)
                 latest = self._latest_detail(conn, quarter)
                 if latest is None:
                     raise ApiError(409, "detail_required",
@@ -493,6 +612,7 @@ class BulletinService:
         try:
             with transaction(conn):
                 q = self._quarter_row(conn, quarter)
+                self._ensure_writable(conn, quarter)
                 existing = self._bulletin_row(conn, quarter)
                 if existing is not None:
                     raise conflict(
@@ -576,7 +696,12 @@ class BulletinService:
                     )
 
                 payload = self._build_payload(
-                    quarter, q, values, row_totals, col_totals, masked,
+                    quarter, json.loads(q["district_labels"]),
+                    json.loads(q["industry_labels"]), row_totals, col_totals,
+                    [[None if (i, j) in masked else values[i][j]
+                      for j in range(len(col_totals))]
+                     for i in range(len(row_totals))],
+                    now(),
                 )
                 try:
                     conn.execute(
@@ -607,15 +732,9 @@ class BulletinService:
         return payload
 
     @staticmethod
-    def _build_payload(quarter, q, values, row_totals, col_totals,
-                       masked) -> dict[str, Any]:
-        districts = json.loads(q["district_labels"])
-        industries = json.loads(q["industry_labels"])
-        visible = [
-            [None if (i, j) in masked else values[i][j]
-             for j in range(len(industries))]
-            for i in range(len(districts))
-        ]
+    def _build_payload(quarter, districts, industries, row_totals, col_totals,
+                       visible: list[list[int | None]],
+                       published_at: str) -> dict[str, Any]:
         return {
             "quarter": quarter,
             "districts": [
@@ -632,8 +751,191 @@ class BulletinService:
             # Only published totals and disclosed cells leave the server.
             # ``None`` marks a cell that is not disclosed.
             "cells": visible,
-            "published_at": now(),
+            "published_at": published_at,
         }
+
+    # --------------------------------------------------------------- backfill
+
+    def _copy_payload(self, copy: PublishedCopy) -> dict[str, Any]:
+        districts, industries, row_totals, col_totals = copy_axes(copy)
+        return self._build_payload(
+            copy.quarter, districts, industries, row_totals, col_totals,
+            [list(row) for row in copy.cells], copy.published_at,
+        )
+
+    def backfill(self, batch: BackfillBatch,
+                 token_id: int | None) -> dict[str, Any]:
+        """Import published copies from the retired system.
+
+        The copies are public archives: only totals and disclosed cells are
+        known.  Each copy is validated against the rules from the copy alone
+        (margins, masking, feasibility, two-value guarantee) and against the
+        locally registered totals; then the whole batch is written in one
+        ``BEGIN IMMEDIATE`` transaction so a single bad copy leaves nothing
+        behind.
+
+        Idempotency is content-based: re-sending an identical copy for an
+        already back-filled quarter succeeds without writing a second
+        bulletin; a different copy for a quarter that already has a bulletin
+        is rejected and the offending quarter is named.
+        """
+        from .db import connect
+
+        # Validate everything before touching the database: a batch is
+        # all-or-nothing and the error points at the copy's position.
+        first_seen: dict[str, int] = {}
+        for index, copy in enumerate(batch.copies):
+            if copy.quarter in first_seen:
+                earlier = batch.copies[first_seen[copy.quarter]]
+                if not _same_content(json.dumps(self._copy_payload(earlier)),
+                                     self._copy_payload(copy)):
+                    raise conflict(
+                        "bulletin_content_conflict",
+                        f"{copy.quarter} appears twice in the batch with "
+                        f"different content",
+                        {"quarter": copy.quarter,
+                         "first_index": first_seen[copy.quarter],
+                         "index": index},
+                    )
+            else:
+                first_seen[copy.quarter] = index
+            problems = copy_problems(copy)
+            if problems:
+                raise ApiError(
+                    422, "invalid_copy",
+                    f"copy {index} ({copy.quarter}) is not a valid published "
+                    f"bulletin",
+                    {"index": index, "quarter": copy.quarter,
+                     "issues": problems},
+                )
+
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                imported: list[dict[str, Any]] = []
+                unchanged: list[dict[str, Any]] = []
+                for copy in batch.copies:
+                    districts, industries, row_totals, col_totals = \
+                        copy_axes(copy)
+                    payload = self._copy_payload(copy)
+                    existing = conn.execute(
+                        "SELECT * FROM bulletins WHERE quarter=?",
+                        (copy.quarter,),
+                    ).fetchone()
+                    if existing is not None:
+                        # Idempotency compares the statistical content, not
+                        # the archival timestamp: an identical copy must
+                        # succeed even if the instant was normalised.
+                        if not _same_content(existing["payload_json"], payload):
+                            raise conflict(
+                                "bulletin_content_conflict",
+                                f"{copy.quarter} already has a published "
+                                f"bulletin with different content",
+                                {"quarter": copy.quarter,
+                                 "existing_source": existing["source"],
+                                 "published_at": existing["published_at"]},
+                            )
+                        unchanged.append({"quarter": copy.quarter,
+                                          "published_at":
+                                              existing["published_at"]})
+                        continue
+
+                    quarter_row = conn.execute(
+                        "SELECT * FROM quarters WHERE quarter=?",
+                        (copy.quarter,),
+                    ).fetchone()
+                    if quarter_row is not None:
+                        self._check_registered(copy, quarter_row)
+                    else:
+                        self._register_backfilled_quarter(
+                            conn, copy, districts, industries, row_totals,
+                            col_totals, token_id,
+                        )
+                    try:
+                        conn.execute(
+                            "INSERT INTO bulletins(quarter, detail_version, "
+                            "mask_version, payload_json, published_at, "
+                            "published_by, source, backfilled_at) "
+                            "VALUES(?,?,?,?,?,?,?,?)",
+                            (
+                                copy.quarter,
+                                # A copy has no local detail version; 0 means
+                                # "published from a public copy".
+                                0,
+                                None,
+                                json.dumps(payload),
+                                copy.published_at,
+                                token_id,
+                                "backfill",
+                                now(),
+                            ),
+                        )
+                    except Exception as exc:  # UNIQUE(quarter) guard for races
+                        if "UNIQUE" in str(exc).upper():
+                            raise conflict(
+                                "already_published",
+                                f"{copy.quarter} already has a published "
+                                f"bulletin",
+                                {"quarter": copy.quarter},
+                            ) from exc
+                        raise
+                    imported.append({"quarter": copy.quarter,
+                                     "published_at": copy.published_at})
+        finally:
+            conn.close()
+
+        return {
+            "imported": imported,
+            "unchanged": unchanged,
+            "count": len(imported) + len(unchanged),
+            "imported_count": len(imported),
+            "unchanged_count": len(unchanged),
+        }
+
+    @staticmethod
+    def _check_registered(copy: PublishedCopy, quarter_row) -> None:
+        """Registered names and totals must match the copy exactly."""
+        registered = {
+            "districts": json.loads(quarter_row["district_labels"]),
+            "industries": json.loads(quarter_row["industry_labels"]),
+            "row_totals": json.loads(quarter_row["row_totals"]),
+            "col_totals": json.loads(quarter_row["col_totals"]),
+        }
+        districts, industries, row_totals, col_totals = copy_axes(copy)
+        submitted = {"districts": districts, "industries": industries,
+                     "row_totals": row_totals, "col_totals": col_totals}
+        differences = {
+            key: {"registered": registered[key], "copy": submitted[key]}
+            for key in submitted if registered[key] != submitted[key]
+        }
+        if differences:
+            raise conflict(
+                "registered_totals_mismatch",
+                f"the copy for {copy.quarter} disagrees with the totals "
+                f"registered for that quarter",
+                {"quarter": copy.quarter, "differences": differences},
+            )
+
+    @staticmethod
+    def _register_backfilled_quarter(conn, copy: PublishedCopy,
+                                     districts, industries, row_totals,
+                                     col_totals, token_id) -> None:
+        """Fix the copy's axes and totals so normal editing can continue."""
+        registered_at = now()
+        conn.execute(
+            "INSERT INTO quarters(quarter, district_labels, industry_labels, "
+            "row_totals, col_totals, registered_at, registered_by) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                copy.quarter,
+                json.dumps(districts),
+                json.dumps(industries),
+                json.dumps(row_totals),
+                json.dumps(col_totals),
+                registered_at,
+                token_id,
+            ),
+        )
 
     # ----------------------------------------------------------------- reads
 
@@ -710,7 +1012,23 @@ class BulletinService:
             "bulletin_detail_version": (
                 bulletin["detail_version"] if bulletin else None
             ),
+            "source": bulletin["source"] if bulletin else None,
+            "backfilled_at": bulletin["backfilled_at"] if bulletin else None,
+            "draft_read_only": bulletin is not None,
         }
+        if bulletin is not None and bulletin["source"] == "backfill":
+            # A back-filled quarter only ever held a public copy: the
+            # disclosed cells are what the old system published, and any
+            # locally entered detail stays a read-only draft.
+            payload = json.loads(bulletin["payload_json"])
+            state["from_public_copy"] = True
+            state["copy_cells"] = payload["cells"]
+            state["note"] = (
+                "this quarter was back-filled from a public bulletin copy; "
+                "the copy is authoritative and local drafts are read-only"
+            )
+        else:
+            state["from_public_copy"] = False
         if latest and mask_row:
             values = json.loads(latest["values_json"])
             must_public = _cells(json.loads(latest["must_public"]))

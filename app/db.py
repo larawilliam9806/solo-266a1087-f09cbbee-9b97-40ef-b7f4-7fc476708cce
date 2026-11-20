@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS bulletins(
     mask_version     INTEGER,
     payload_json     TEXT    NOT NULL,
     published_at     TEXT    NOT NULL,
-    published_by     INTEGER
+    published_by     INTEGER,
+    source           TEXT    NOT NULL DEFAULT 'editor',
+    backfilled_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS editor_tokens(
@@ -75,7 +77,23 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database created by an earlier release up to date.
+
+    ``bulletins`` gained ``source``/``backfilled_at`` so a back-filled copy
+    can be told apart from an editor-published bulletin; existing rows keep
+    the default ``editor`` source.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(bulletins)")}
+    if "source" not in columns:
+        conn.execute("ALTER TABLE bulletins ADD COLUMN source TEXT NOT NULL "
+                     "DEFAULT 'editor'")
+    if "backfilled_at" not in columns:
+        conn.execute("ALTER TABLE bulletins ADD COLUMN backfilled_at TEXT")
 
 
 @contextmanager

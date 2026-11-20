@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 INF = 1 << 60
 
@@ -43,9 +43,16 @@ class _Dinic:
         self.n = n
         self.graph: list[list[list[int]]] = [[] for _ in range(n)]
 
-    def add(self, u: int, v: int, cap: int) -> None:
-        self.graph[u].append([v, cap, len(self.graph[v])])
+    def add(self, u: int, v: int, cap: int) -> list[int]:
+        """Add an edge and return the forward edge (``[v, residual, rev]``).
+
+        The returned list is live: after ``maxflow`` its residual capacity is
+        ``original_capacity - flow``, which lets callers recover the flow.
+        """
+        forward = [v, cap, len(self.graph[v])]
+        self.graph[u].append(forward)
         self.graph[v].append([u, 0, len(self.graph[u]) - 1])
+        return forward
 
     def maxflow(self, s: int, t: int) -> int:
         if s == t:
@@ -108,6 +115,59 @@ def cell_bounds(values: Sequence[Sequence[int]], edges: Sequence[Cell],
     up = _residual(n_rows, n_cols, edges, values, cell).maxflow(n_rows + j, i)
     down = _residual(n_rows, n_cols, edges, values, cell).maxflow(i, n_rows + j)
     return value - min(value, down), value + up
+
+
+def complete_table(row_sums: Sequence[int], col_sums: Sequence[int],
+                   fixed: Mapping[Cell, int]) -> list[list[int]] | None:
+    """A non-negative integer table with the given margins and fixed cells.
+
+    Returns ``None`` when no such table exists.  This is the feasibility
+    question for a back-filled copy: visible cells are fixed, masked cells are
+    free, and the margins are the published totals.  A single max-flow over
+    the masked-cell bipartite graph decides it exactly (integrality is free
+    because the capacities are integers).
+    """
+    n_rows, n_cols = len(row_sums), len(col_sums)
+    residual_r = list(row_sums)
+    residual_c = list(col_sums)
+    table = [[0] * n_cols for _ in range(n_rows)]
+    free: list[Cell] = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if (i, j) in fixed:
+                value = fixed[(i, j)]
+                table[i][j] = value
+                residual_r[i] -= value
+                residual_c[j] -= value
+            else:
+                free.append((i, j))
+    if any(value < 0 for value in residual_r) or \
+            any(value < 0 for value in residual_c):
+        return None
+    if not free:
+        return table if not any(residual_r) and not any(residual_c) else None
+
+    # source -> row -> free cell -> column -> sink.  The source->row and
+    # column->sink capacities are the residual margins, so a full flow pairs
+    # every unit with a free cell and yields the table directly.
+    source = n_rows + n_cols
+    sink = source + 1
+    flow = _Dinic(sink + 1)
+    for i in range(n_rows):
+        flow.add(source, i, residual_r[i])
+    cell_edges: dict[Cell, list[int]] = {}
+    for i, j in free:
+        cell_edges[(i, j)] = flow.add(i, n_rows + j, INF)
+    for j in range(n_cols):
+        flow.add(n_rows + j, sink, residual_c[j])
+
+    if flow.maxflow(source, sink) != sum(residual_r):
+        return None
+    # Free-cell edges had capacity INF, so the flow through one is what is
+    # missing from its residual capacity.
+    for (i, j), edge in cell_edges.items():
+        table[i][j] = INF - edge[1]
+    return table
 
 
 @dataclass(frozen=True)

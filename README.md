@@ -128,6 +128,72 @@ pytest                             # 测试
 
 `GET /api/v1/bulletins` 列出已发布季度及总计。
 
+### 7. 编辑补档（从公开副本回填）
+
+`POST /api/v1/editor/backfill`（编辑令牌；每批 1～8 份）
+
+旧系统只留下已发布公报的公开副本。补档接口把这些副本直接登记为正式公报，
+并让该季度同时出现在单季接口和列表里。请求体：
+
+```json
+{
+  "copies": [
+    {
+      "quarter": "2023Q1",
+      "districts": [{"name": "东城区", "total": 120}, ...],
+      "industries": [{"name": "制造业", "total": 110}, ...],
+      "row_totals": [120, 95, 60, 50],        // 可省略，须与 districts 一致
+      "col_totals": [110, 108, 107],          // 可省略，须与 industries 一致
+      "grand_total": 325,                      // 可省略，须与区县合计之和一致
+      "cells": [[30, null, null], [25, 35, 35], ...],
+      "published_at": "2023-04-15T09:00:00+00:00"
+    }
+  ]
+}
+```
+
+* **格式沿用单季公开接口**：`districts` / `industries` / `row_totals` /
+  `col_totals` / `grand_total` / `cells` 与 `GET /api/v1/bulletins/{quarter}`
+  完全一致，`null` 表示未披露；额外要求 `published_at`（保留原发布时间）。
+  归档 JSON 可原样提交。
+* **仅凭副本校验**：完全不依赖本地明细，只检查副本自身能否成立：
+  * 区县合计之和 = 行业合计之和 = `grand_total`；
+  * 可见格之和不超出所在行/列合计；
+  * 可见格不得是 1～4 户（必须遮盖）；
+  * 交叉表可以补成满足合计的非负整数表（`suppression.complete_table`，
+    一次最大流精确判定）；
+  * 每个遮盖格在该可行域内至少有两种可能取值（与常规发布同一套精确边界）。
+  任一不满足 → 422 `invalid_copy`，`details.issues[]` 逐条说明
+  （`sensitive_cell_visible` / `no_feasible_table` / `cell_uniquely_determined` /
+  `visible_cells_exceed_margin` / `totals_inconsistent` 等）。
+* **已登记的区县、行业及合计必须与副本一致**：该季度在本地登记过合计时，
+  名称与数值须逐项相同，否则 409 `registered_totals_mismatch`。
+  未登记时，直接以副本的维度与合计完成登记，之后同样固定。
+* **幂等与冲突**：季度已有正式公报时，内容（除归档时间外的全部公开字段）
+  相同则重送成功并计入 `unchanged`；内容不同 → 409
+  `bulletin_content_conflict`，`details.quarter` 指出冲突季度。
+* **整批原子**：所有副本先校验，再在单个 `BEGIN IMMEDIATE` 事务里写入；
+  任何一份失败（校验不通过、与已有公报冲突等）整批都不生效。批内同一季度出现两次时，
+  内容相同则只入档一次，内容不同则 409 `bulletin_content_conflict` 并指出季度。
+* **每季只有一份正式公报**：补档与常规发布共用 `bulletins.quarter` 唯一约束，
+  交错执行也不会出现第二份；补档成功后常规发布返回 409。
+* **只保存公开副本**：只写合计与可见格，遮盖保持 `null`，不反推被遮盖的数值，
+  也不生成明细版本或遮盖计划。`published_at` 使用副本里的原发布时间。
+* **编辑查询**：`GET /api/v1/editor/quarters/{quarter}` 返回
+  `source: "backfill"`、`from_public_copy: true`、`copy_cells`（公开副本的格子，
+  `null` 即遮盖）与 `draft_read_only: true`；已有的本地明细/遮盖草稿保留为只读，
+  明细、遮盖、发布接口对该季度返回 409 `quarter_read_only`。
+
+响应体：
+
+```json
+{
+  "imported": [{"quarter": "2023Q1", "published_at": "2023-04-15T09:00:00+00:00"}],
+  "unchanged": [],
+  "count": 1, "imported_count": 1, "unchanged_count": 0
+}
+```
+
 ---
 
 ## 保密性判定（为什么是精确的，不是启发式）
@@ -144,6 +210,10 @@ pytest                             # 测试
 测试里用暴力枚举所有可行矩阵做了交叉验证（`tests/test_api.py::test_suppression_bounds_match_brute_force`）。
 
 补遮建议的搜索：优先加入能最大程度减少冲突的格，随后做逐格必要性剔除。
+
+补档的可行性问题（可见格固定、遮盖格自由，是否存在满足合计的非负整数表）同样是一次
+最大流：源点→区县节点容量为剩余合计，区县→行业格子边、行业→汇点容量为剩余合计，
+满流即存在可行表；整数性由整数容量直接保证。补档校验随后用同一套精确边界检查每个遮盖格。
 
 ---
 
@@ -175,3 +245,6 @@ Dockerfile / docker-compose.yml
   但发布必须完整合规，复核在发布瞬间进行。
 * **公开载荷最小化**：公开接口只返回合计与可见格；明细版本、遮盖计划、必公开清单等内部
   状态不出现在响应里。
+* **补档只存公开副本**：旧系统的遮盖信息本身就是「不可恢复」的承诺。补档不做插值、
+  不反推遮盖值、不生成虚假明细，只把副本原样作为正式公报保存（`source=backfill`），
+  因此补档本身不会泄露比原公报更多的信息。
